@@ -76,7 +76,38 @@ module tb;
 	number_test++;
     #10;
   endtask
+  
+  
+  // A Task que faz a troca de modos 
+  task automatic switch_mode(input int pulses, input string description = "");
+    static int test_number = 1;
+    logic expected_led;
     
+    if (pulses > 5310 && pulses < 10350)
+      expected_led = ~led;
+    else 
+      expected_led = led;
+    
+    $display("[%0t] TESTE %2d: %s", $time, test_number, description);
+    $display("-----------------------------------------------------------------------------------");
+    
+    press_button(pulses);
+    
+	// 4. Comparação dos leds
+    if (led === expected_led) begin
+      $display("RESULTADO: [PASSOU] | Pulsos: %0d | LED: %b | Output: %b | LED Esperado: %b", pulses, led, saida, expected_led);
+    end else begin
+      $error("RESULTADO: [FALHOU] | Enviado: %0d | LED: %b | Output: %b | LED Esperado: %b", pulses, led, saida, expected_led);
+    end
+    $display("-----------------------------------------------------------------------------------");
+    test_number++;
+    
+    
+  endtask
+  
+  
+  
+  
   initial begin
     $dumpfile("tb.vcd");
     $dumpvars(0, tb);
@@ -84,8 +115,8 @@ module tb;
   
   // Setando sinais principais
   initial begin
-    clk = 0;
     rst = 0;
+    clk = 0;
     infravermelho = 0;
     push_button = 0;
   end
@@ -95,22 +126,35 @@ module tb;
   
   initial begin
     
+   	logic led_expected;
+    logic output_expected;
+    
     // Sistema Resetado - (Desligado Automático) 
     $display("[%0t] Início da Simulação", $time);
     $display("[%0t] Aplicando Reset...", $time);
     reset(10);
     $display("[%0t] Reset finalizado.", $time);
-    check_condition("Sistema Resetado", 0, led);
+    
+    led_expected = 0;
+    output_expected = 0;
+    
+    // Teste RESET do sistema - LAMP_DES_AUTO
+    check_condition("RESET", led_expected, led);
+    check_condition("RESET", output_expected, saida);
     
     $srandom(SEED);
     random_n = new(MIN, MAX);
     
+    $display("-----------------------------------------------------------------------------------");
     repeat (30) begin
       if (random_n.randomize()) begin
         $display("NÚMERO SORTEADO: %d", random_n.number);
+        $display("ESTADO ATUAL: %s", dut.sub_1.state.name());
+        switch_mode(random_n.number);
       end else begin
         $display("ERRO AO RANDOMIZAR!");
       end
+  
     end
     
     
