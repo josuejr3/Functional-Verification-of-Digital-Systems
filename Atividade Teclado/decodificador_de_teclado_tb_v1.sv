@@ -483,41 +483,63 @@ module decodificador_de_teclado_tb;
     $display("\n------ INICIANDO CENÁRIO 4: VERIFICAÇÃO DE AUTOREPEAT ------");
     reset();
     enable = 1;
-    injetar_ruido = 0; // Isolamento contra ruído
+    injetar_ruido = 0;
 
     begin : c4_autorepeat
       int mudancas_no_barramento = 0;
       bit c4_terminou = 0;
-      int tecla_repeat = 3; // Força uma tecla conhecida para análise visual
+      int tecla_repeat = 3;
       logic [19:0][3:0] barramento_anterior;
-      
-      // 5500 ciclos são suficientes: 130 (inicial) + 2000 (2s) + 1000 (1s) + 1000 (1s) + folga
-      int ciclos_teste = 5500; 
-      
+
+      int ciclos_teste = 5500;
+
       $display("Passo A: Mantendo a tecla %0d pressionada por %0d ciclos...", tecla_repeat, ciclos_teste);
-      
-      // Armazena o estado inicial do barramento antes do teste estendido
+
       barramento_anterior = digitos_value_DUV.digits;
 
       fork
-        // Thread 1: Monitora modificações no barramento em tempo real
-        begin
-          // Espera passar a primeira inserção padrão para não contar duas vezes
+        // Thread 1: Monitora modificações e verifica intervalo entre repetições
+        begin : monitor_intervalo
+          int ultimo_tempo_repeat;
+          int delta_ciclos;
+          localparam int PERIODO_ESPERADO = 1000;
+          localparam int TOLERANCIA       = 20;
+
           repeat(150) @(posedge clk);
-          barramento_anterior = digitos_value_DUV.digits;
+          barramento_anterior  = digitos_value_DUV.digits;
+          ultimo_tempo_repeat  = $time;
 
           while (!c4_terminou) begin
             @(posedge clk);
-            // Se o barramento mudou enquanto a tecla está travada, foi um estalo do Autorepeat!
             if (digitos_value_DUV.digits != barramento_anterior) begin
               mudancas_no_barramento++;
-              $display("  [MONITOR] Autorepetição detectada em %0t ns! Barramento atualizado: %h", $time, digitos_value_DUV.digits);
+              delta_ciclos = ($time - ultimo_tempo_repeat) / 10;
+
+              $display("  [MONITOR] Autorepetição #%0d em %0t ns | Intervalo: %0d ciclos | Barramento: %h",
+                       mudancas_no_barramento, $time, delta_ciclos, digitos_value_DUV.digits);
+
+              // Verifica intervalo apenas a partir da 2ª repetição
+              // (a 1ª é o delay inicial de 2s, não o período de 1s)
+              if (mudancas_no_barramento >= 2) begin
+                if (delta_ciclos < (PERIODO_ESPERADO - TOLERANCIA) ||
+                    delta_ciclos > (PERIODO_ESPERADO + TOLERANCIA)) begin
+                  $display("\n[ERRO INTERVALO] Repetição #%0d fora do período esperado!", mudancas_no_barramento);
+                  $display("  Esperado: %0d ciclos (±%0d) | Obtido: %0d ciclos",
+                           PERIODO_ESPERADO, TOLERANCIA, delta_ciclos);
+                  $finish;
+                end else begin
+                  $display("  [OK] Intervalo dentro da janela permitida (%0d a %0d ciclos).",
+                           PERIODO_ESPERADO - TOLERANCIA, PERIODO_ESPERADO + TOLERANCIA);
+                end
+              end
+
               barramento_anterior = digitos_value_DUV.digits;
+              ultimo_tempo_repeat = $time;
             end
           end
         end
-        
-        // Thread 2: Executa o pressionamento longo na sua task
+
+        // Thread 2: Executa o pressionamento longo
         begin
           pressionar_tecla(pad_linhas[tecla_repeat], pad_colunas[tecla_repeat], ciclos_teste, 0);
           c4_terminou = 1;
@@ -526,41 +548,39 @@ module decodificador_de_teclado_tb;
 
       // VERIFICAÇÃO DO COMPORTAMENTO DO DUV
       $display("\nAnálise final do barramento DUV: %h", digitos_value_DUV.digits);
-      
+
       if (mudancas_no_barramento >= 2) begin
         $display("[OK] O recurso de autorepetição adicionou %0d dígitos extras por tempo de retenção.", mudancas_no_barramento);
       end else begin
         $display("\n[ERRO AUTOREPEAT] A tecla ficou retida mas o barramento só registrou %0d repetições extras.", mudancas_no_barramento);
         $finish;
       end
-      
+
+      // Passo B: Verificação de cessação
       $display("Passo B: Soltando a tecla e verificando cessação do autorepeat...");
 
-begin : c4_verificar_cessacao
-  logic [19:0][3:0] barramento_apos_soltar;
-  int mudancas_apos_soltar = 0;
-  int CICLOS_OBSERVACAO = 3000; // > 2 períodos de repeat (2000 ciclos) para garantir
+      begin : c4_verificar_cessacao
+        logic [19:0][3:0] barramento_apos_soltar;
+        int mudancas_apos_soltar = 0;
+        int CICLOS_OBSERVACAO = 3000;
 
-  // Captura o barramento no momento exato em que a tecla é solta
-  @(negedge clk);
-  barramento_apos_soltar = digitos_value_DUV.digits;
+        @(negedge clk);
+        barramento_apos_soltar = digitos_value_DUV.digits;
 
-  // Observa por 3000 ciclos se o barramento muda sem a tecla pressionada
-  repeat (CICLOS_OBSERVACAO) begin
-    @(posedge clk);
-    if (digitos_value_DUV.digits !== barramento_apos_soltar) begin
-      mudancas_apos_soltar++;
-      $display("\n[ERRO CESSACAO] O barramento mudou %0d ciclos após soltar a tecla! Valor: %h",
-               ($time / 10), digitos_value_DUV.digits);
-      $finish;
-    end
-  end
+        repeat (CICLOS_OBSERVACAO) begin
+          @(posedge clk);
+          if (digitos_value_DUV.digits !== barramento_apos_soltar) begin
+            mudancas_apos_soltar++;
+            $display("\n[ERRO CESSACAO] O barramento mudou %0d ciclos após soltar a tecla! Valor: %h",
+                     ($time / 10), digitos_value_DUV.digits);
+            $finish;
+          end
+        end
 
-  if (mudancas_apos_soltar == 0) begin
-    $display("[OK] Autorepeat cessou imediatamente após a liberação da tecla.");
-  end
-end
-      
+        if (mudancas_apos_soltar == 0) begin
+          $display("[OK] Autorepeat cessou imediatamente após a liberação da tecla.");
+        end
+      end
 
       // ==================================================================
       // RELATÓRIO DE VERIFICAÇÃO DETALHADO — CENÁRIO 4 (AUTOREPEAT)
@@ -573,7 +593,7 @@ end
       $display("  Tecla Testada          : %0d", tecla_repeat);
       $display("  Duração da Retenção    : %0d ciclos", ciclos_teste);
       $display("  Dígitos Extras Gerados : %0d", mudancas_no_barramento);
-      $display("  Posições Iniciais      : [digits[2]=%h, digits[1]=%h, digits[0]=%h]", 
+      $display("  Posições Iniciais      : [digits[2]=%h, digits[1]=%h, digits[0]=%h]",
                 digitos_value_DUV.digits[2], digitos_value_DUV.digits[1], digitos_value_DUV.digits[0]);
       $display("========================================================");
       $display("");
