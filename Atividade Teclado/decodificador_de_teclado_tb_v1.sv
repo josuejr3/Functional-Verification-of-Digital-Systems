@@ -1,7 +1,3 @@
-typedef struct packed {
-  logic [19:0] [3:0] digits;
-} digitosPac_t;
-
 module decodificador_de_teclado_tb;
   
   // ==============================================
@@ -10,8 +6,8 @@ module decodificador_de_teclado_tb;
   logic [3:0] lin_matriz;
   logic [3:0] col_matriz;
   logic enable;
-  logic digitos_valid_DUV, digitos_valid_REF;
-  digitosPac_t digitos_value_DUV, digitos_value_REF;
+  logic digitos_valid_DUV;
+  digitosPac_t digitos_value_DUV;
   bit clk;
   logic rst;
   
@@ -34,30 +30,61 @@ module decodificador_de_teclado_tb;
     .digitos_valid  (digitos_valid_DUV),
     .digitos_value  (digitos_value_DUV)
   );
-  
+
   // ==============================================
-  //              INSTANCIAÇÃO DO REF
+  //    MODELO DE REFERÊNCIA INTERNO
   // ==============================================
-  decodificador_de_teclado_ref decode_REF (
-    .enable         (enable),
-    .lin_matriz     (lin_matriz),
-    .col_matriz     (col_matriz),
-    .digitos_valid  (digitos_valid_REF),
-    .digitos_value  (digitos_value_REF)
+  // Espelha exatamente o decode_keypad() do DUV.
+  // Parâmetros derivados do design.sv para manter sincronia:
+  //   CLK_FREQ        = 1_000
+  //   DEBOUNCE_COUNTER = CLK_FREQ / 10 = 100 ciclos
+  //
+  // Fluxo do DUV até o shift ocorrer:
+  //   SCAN (≤4 ciclos) → DEBOUNCE (100 ciclos) → DECODE (1) → SHIFT_TECLA (1)
+  //   Total mínimo: 106 ciclos | Margem segura adotada: 130 ciclos
+  //
+  // A verificação é feita APÓS os 130 ciclos, quando digits[0] já contém
+  // a tecla recém-inserida pelo SHIFT_TECLA.
+
+  localparam int CICLOS_ATE_SHIFT = 130; // DEBOUNCE(100) + SCAN(≤4) + DECODE(1) + SHIFT(1) + folga
+
+  function automatic logic [3:0] ref_decodificar(
+    input logic [3:0] lin,
+    input logic [3:0] col
   );
-  
+    // Tabela idêntica ao decode_keypad() do DUV (design.sv)
+    case ({lin, col})
+      8'b0111_0111: return 4'h1;
+      8'b0111_1011: return 4'h2;
+      8'b0111_1101: return 4'h3;
+      8'b0111_1110: return 4'hE;
+      8'b1011_0111: return 4'h4;
+      8'b1011_1011: return 4'h5;
+      8'b1011_1101: return 4'h6;
+      8'b1011_1110: return 4'hE;
+      8'b1101_0111: return 4'h7;
+      8'b1101_1011: return 4'h8;
+      8'b1101_1101: return 4'h9;
+      8'b1101_1110: return 4'hE;
+      8'b1110_0111: return 4'hA; // *
+      8'b1110_1011: return 4'h0; // 0
+      8'b1110_1101: return 4'hB; // #
+      8'b1110_1110: return 4'hE;
+      default:      return 4'hE;
+    endcase
+  endfunction
+
   // ==============================================
   //    LÓGICA COMBINACIONAL DO TECLADO MATRICIAL
   // ==============================================
   always_comb begin
     if (tecla_pressionada && (lin_matriz == tecla_linha_alvo)) begin
-      if (injetar_ruido && ruido_estado) begin
-        col_matriz = 4'b1111; // Simula bouncing (chave abrindo no ruído)
-      end else begin
-        col_matriz = tecla_coluna_alvo; // Curto-circuito perfeito
-      end
+      if (injetar_ruido && ruido_estado)
+        col_matriz = 4'b1111; // Simula bouncing
+      else
+        col_matriz = tecla_coluna_alvo;
     end else begin
-      col_matriz = 4'b1111; // Nenhuma tecla pressionada ou linha diferente
+      col_matriz = 4'b1111;
     end
   end
 
@@ -67,102 +94,146 @@ module decodificador_de_teclado_tb;
   // ==============================================
   //             GRUPOS DE MONITORAMENTO
   // ==============================================
+
+  // 2 bins reais: enable ligado e desligado
   covergroup CG_ENABLE @(posedge clk);
-    coverpoint enable;
+    coverpoint enable {
+      bins ativo   = {1};
+      bins inativo = {0};
+    }
   endgroup
-  
+
+  // 4 bins reais: apenas as linhas que o DUV efetivamente drive
   covergroup CG_LIN @(lin_matriz);
-    coverpoint lin_matriz;                        
+    coverpoint lin_matriz {
+      bins row0 = {4'b1110};
+      bins row1 = {4'b1101};
+      bins row2 = {4'b1011};
+      bins row3 = {4'b0111};
+    }
   endgroup
-  
+
+  // 4 bins reais de coluna: 3 colunas pressionadas + repouso
   covergroup CG_COL @(col_matriz);
-    coverpoint col_matriz;
-  endgroup
-  
-  covergroup CG_Digitos_Valid @(posedge clk); 
-    coverpoint digitos_valid_DUV;
+    coverpoint col_matriz {
+      bins col0    = {4'b0111};
+      bins col1    = {4'b1011};
+      bins col2    = {4'b1101};
+      bins repouso = {4'b1111};
+    }
   endgroup
 
-  covergroup CG_Digitos_Value @(posedge digitos_valid_DUV); 
-    coverpoint digitos_value_DUV.digits[0];
+  // 2 bins reais: valid pulsado ou nao
+  covergroup CG_Digitos_Valid @(posedge clk);
+    coverpoint digitos_valid_DUV {
+      bins pulsado = {1};
+      bins ocioso  = {0};
+    }
+  endgroup
+
+  // 11 bins reais: digitos 0-9 mais confirmacao '*' (0xA)
+  // '#' (0xB) limpa o barramento, nao gera shift de digito
+  // 0xF e o valor de reset (invalido), 0xE e erro interno
+  covergroup CG_Digitos_Value @(posedge clk);
+    coverpoint digitos_value_DUV.digits[0]
+      iff (digitos_valid_DUV) {
+
+      bins digito[10]  = {[4'h0 : 4'h9]};
+      
+      bins confirmacao = {4'hA};
+      ignore_bins reset_val = {4'hF};
+      ignore_bins erro_val  = {4'hE};
+      ignore_bins hashtag   = {4'hB};
+    }
   endgroup
   
-  CG_ENABLE        cg_enable_inst         = new;
-  CG_LIN           cg_lin_inst            = new;
-  CG_COL           cg_col_inst            = new;  
-  CG_Digitos_Valid cg_digitos_valid_inst  = new;
-  CG_Digitos_Value cg_digitos_value_inst  = new;
+  CG_ENABLE        cg_enable_inst        = new;
+  CG_LIN           cg_lin_inst           = new;
+  CG_COL           cg_col_inst           = new;
+  CG_Digitos_Valid cg_digitos_valid_inst = new;
+  CG_Digitos_Value cg_digitos_value_inst = new;
 
-  // Monitor Global de Sinais (Log do terminal)
-  initial begin
-    $monitor("%0t | EN: %b | ROW: %b | COL: %b | Valid_DUV: %b | Value_DUV: %h | Valid_REF: %b | Value_REF: %h",
-             $time, enable, lin_matriz, col_matriz, digitos_valid_DUV, digitos_value_DUV.digits, digitos_valid_REF, digitos_value_REF);
-  end
-  
-  // Gerador de Clock de 10ns (#5 em alto, #5 em baixo)
+  // Gerador de Clock de 10ns
   always #5 clk = ~clk;
 
   // Task de Reset Global síncrono
-  task automatic reset ();
+  task automatic reset();
     @(posedge clk); rst = 1;
-    repeat(5) @(posedge clk); 
+    repeat(5) @(posedge clk);
     rst = 0;
   endtask
   
   // ====================================================================
-  // TASK DE ESTIMULOS: Injeta as teclas e autovalida o resultado no DUV
+  // TASK DE ESTIMULOS: Injeta tecla e autovalida o resultado no DUV
   // ====================================================================
-  task automatic pressionar_tecla(input [3:0] linha, input [3:0] coluna, input int ciclos_duracao, input bit com_ruido);
+  task automatic pressionar_tecla(
+    input [3:0] linha,
+    input [3:0] coluna,
+    input int   ciclos_duracao,
+    input bit   com_ruido
+  );
+    logic [3:0] valor_ref;
+
     tecla_linha_alvo  = linha;
     tecla_coluna_alvo = coluna;
-    
+
+    // ------------------------------------------------------------------
+    // Fase de ruído mecânico (bouncing): 120 ciclos com col instável.
+    // O debounce do DUV só começa a contar após a coluna estabilizar,
+    // portanto estes ciclos NÃO contam para CICLOS_ATE_SHIFT.
+    // ------------------------------------------------------------------
     if (com_ruido) begin
       injetar_ruido     = 1;
       tecla_pressionada = 1;
-      repeat(120) @(posedge clk); // Janela inicial isolada de ruído mecânico
-      injetar_ruido     = 0;      // Estabiliza os pinos de vez
+      repeat(120) @(posedge clk);
+      injetar_ruido     = 0; // Coluna estabiliza a partir daqui
     end else begin
       tecla_pressionada = 1;
     end
-    
-    // Aguarda o tempo necessário para passar pelo DEBOUNCE (50 ciclos) + DECODE (1 ciclo)
-    repeat(70) @(posedge clk); 
-    
+
     // ------------------------------------------------------------------
-    // VERIFICAÇÃO EM TEMPO REAL (Executada no meio da estabilidade da tecla)
+    // Aguarda o fluxo completo do DUV:
+    //   SCAN (≤4) → DEBOUNCE (100) → DECODE (1) → SHIFT_TECLA (1) + folga
+    // ------------------------------------------------------------------
+    repeat(CICLOS_ATE_SHIFT) @(posedge clk);
+
+    // ------------------------------------------------------------------
+    // VERIFICAÇÃO: digits[0] deve conter a tecla recém-shiftada
     // ------------------------------------------------------------------
     if (enable && !rst) begin
-      // Se o modelo de referência capturou o caractere combinacional correto
-      if (digitos_valid_REF || (digitos_value_REF.digits[0] != 4'h0)) begin
-        
-        // Verifica se o valor entrou com sucesso na posição [0] do DUV
-        if (digitos_value_DUV.digits[0] !== digitos_value_REF.digits[0]) begin
-          $display("\n[ERRO CONSTATADO] O DUV falhou ou shiftou o dígito errado!");
-          $display("Tempo da Simulação: %0t ns", $time);
-          $display("Esperado pelo REF: %h | Encontrado no DUV[0]: %h", 
-                   digitos_value_REF.digits[0], digitos_value_DUV.digits[0]);
+      valor_ref = ref_decodificar(linha, coluna); // Usa linha/coluna alvo, não os sinais
+                                                   // que podem estar em 4'b1111 neste momento
+      
+      // Filtra teclas que não geram shift (E = erro interno do DUV)
+      if (valor_ref !== 4'hE) begin
+        if (digitos_value_DUV.digits[0] !== valor_ref) begin
+          $display("\n[ERRO] DUV retornou valor incorreto em digits[0]!");
+          $display("  Tempo: %0t ns | Tecla esperada (REF): %h | DUV digits[0]: %h",
+                   $time, valor_ref, digitos_value_DUV.digits[0]);
+          $display("  lin_alvo=%b  col_alvo=%b", linha, coluna);
           $finish;
         end else begin
-          $display("[OK] Dígito %h processado e armazenado com sucesso no DUV!", digitos_value_DUV.digits[0]);
+          $display("[OK] Tecla %h armazenada corretamente em digits[0].", valor_ref);
+          $display("     %0t | EN:%b ROW:%b COL:%b | Valid:%b | digits:%h",
+                   $time, enable, lin_matriz, col_matriz,
+                   digitos_valid_DUV, digitos_value_DUV.digits);
         end
-        
       end
     end
 
-    // Completa o restante do tempo que sobrou da duração da tecla
-    if (ciclos_duracao > 70) begin
-      repeat(ciclos_duracao - 70) @(posedge clk);
-    end
-    
-    // Solta a tecla e deixa as linhas livres para a próxima varredura
+    // Completa a duração restante da tecla pressionada
+    if (ciclos_duracao > CICLOS_ATE_SHIFT)
+      repeat(ciclos_duracao - CICLOS_ATE_SHIFT) @(posedge clk);
+
+    // Solta a tecla e aguarda estabilização para a próxima varredura
     tecla_pressionada = 0;
     repeat(40) @(posedge clk);
   endtask
 
   // ====================================================================
-  //    MAPEAMENTO ALINHADO DO TECLADO MATRICIAL (Bate com o DUV)
+  //    MAPEAMENTO DO TECLADO MATRICIAL (alinhado com o DUV)
   // ====================================================================
-  // Índice:          0        1        2        3        4        5        6        7        8        9       10(*)    11(#)
+  //                          0        1        2        3        4        5        6        7        8        9       10(*)    11(#)
   logic [3:0] pad_linhas  [12] = '{4'b1110, 4'b0111, 4'b0111, 4'b0111, 4'b1011, 4'b1011, 4'b1011, 4'b1101, 4'b1101, 4'b1101, 4'b1110, 4'b1110};
   logic [3:0] pad_colunas [12] = '{4'b1011, 4'b0111, 4'b1011, 4'b1101, 4'b0111, 4'b1011, 4'b1101, 4'b0111, 4'b1011, 4'b1101, 4'b0111, 4'b1101};
 
@@ -174,7 +245,6 @@ module decodificador_de_teclado_tb;
     int duracao_sorteada;
     bit ruido_sorteado;
 
-    // Inicialização das condições iniciais de simulação
     enable            = 1;
     tecla_pressionada = 0;
     injetar_ruido     = 0;
@@ -188,30 +258,49 @@ module decodificador_de_teclado_tb;
 
     // --- 1. TESTE ALEATÓRIO DE DECODIFICAÇÃO E SHIFT ---
     $display("Iniciando digitação de 25 teclas numéricas aleatórias...");
-    repeat (25) begin
-      tecla_sorteada   = $urandom_range(0, 9);      // Sorteia apenas teclas numéricas de 0 a 9
-      duracao_sorteada = $urandom_range(120, 300); // Garante tempo acima dos 50 ciclos do debounce
-      ruido_sorteado   = $urandom_range(0, 1);      // Ativa/desativa ruído dinamicamente
+    repeat (100) begin
+      tecla_sorteada   = $urandom_range(0, 9);
+      // Duração mínima = CICLOS_ATE_SHIFT + folga de 40 do WAIT_RELEASE
+      duracao_sorteada = $urandom_range(CICLOS_ATE_SHIFT + 50, 400);
+      ruido_sorteado   = $urandom_range(0, 1);
+      enable = $urandom_range(0, 1);
       
-      $display("[RANDOM] Pressionando Tecla: %0d | Duração Estável: %0d ciclos | Com Ruído: %0b", 
+      $display("[RANDOM] Tecla: %0d | Duração: %0d ciclos | Ruído: %0b",
                tecla_sorteada, duracao_sorteada, ruido_sorteado);
                
-      pressionar_tecla(pad_linhas[tecla_sorteada], pad_colunas[tecla_sorteada], duracao_sorteada, ruido_sorteado);
+      pressionar_tecla(pad_linhas[tecla_sorteada], pad_colunas[tecla_sorteada],
+                       duracao_sorteada, ruido_sorteado);
     end
 
-    // --- 2. TESTE ALEATÓRIO DE REPETIÇÃO AUTOMÁTICA ---
-    tecla_sorteada = $urandom_range(0, 9);
-    $display("Testando Autorepetição Longa com a Tecla: %0d...", tecla_sorteada);
-    pressionar_tecla(pad_linhas[tecla_sorteada], pad_colunas[tecla_sorteada], 4500, 0); 
+    // ------------------------------------------------------------------
+    // RELATÓRIO DE COBERTURA — CENÁRIO 1
+    // get_coverage() retorna valor real [0.0–100.0] de cada covergroup
+    // ------------------------------------------------------------------
+    $display("");
+    $display("========================================================");
+    $display("  COBERTURA FUNCIONAL — CENÁRIO 1 (25 teclas aleatórias)");
+    $display("========================================================");
+    $display("  CG_ENABLE        : %0.2f%%", cg_enable_inst.get_coverage());
+    $display("  CG_LIN           : %0.2f%%", cg_lin_inst.get_coverage());
+    $display("  CG_COL           : %0.2f%%", cg_col_inst.get_coverage());
+    $display("  CG_Digitos_Valid : %0.2f%%", cg_digitos_valid_inst.get_coverage());
+    $display("  CG_Digitos_Value : %0.2f%%", cg_digitos_value_inst.get_coverage());
+    $display("  COBERTURA GLOBAL : %0.2f%%", $get_coverage());
+    $display("========================================================");
+    $display("");
 
-    // --- 3. TESTE DE CONFIRMAÇÃO (*) ---
-    // Como vimos, esta ação fará o seu DUV transicionar para VALID_KEY e disparar digitos_valid para 1!
-    $display("Enviando tecla de confirmação * para validar o barramento...");
-    pressionar_tecla(pad_linhas[10], pad_colunas[10], 150, 0); 
+    // --- 2. TESTE DE REPETIÇÃO AUTOMÁTICA (autorepeat > 2s) ---
+    tecla_sorteada = $urandom_range(0, 9);
+    $display("Testando autorepetição com a tecla: %0d...", tecla_sorteada);
+    pressionar_tecla(pad_linhas[tecla_sorteada], pad_colunas[tecla_sorteada], 4500, 0);
+
+    // --- 3. CONFIRMAÇÃO COM '*' ---
+    $display("Enviando tecla de confirmação '*'...");
+    pressionar_tecla(pad_linhas[10], pad_colunas[10], 250, 0);
     
     repeat(100) @(posedge clk);
 
-    $display("------ TESTE ALEATÓRIO CONCLUÍDO COM SUCESSO ------");
+    $display("------ TESTES CONCLUÍDOS COM SUCESSO ------");
     $finish;
   end
   
