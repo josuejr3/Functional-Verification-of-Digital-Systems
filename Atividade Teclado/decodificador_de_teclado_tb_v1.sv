@@ -415,59 +415,50 @@ module decodificador_de_teclado_tb;
       logic [19:0][3:0] barramento_inicial;
       logic [19:0][3:0] barramento_pos_ruido;
       logic [19:0][3:0] barramento_final;
-      int digitos_inseridos_durante_ruido = 0;
-      int digitos_inseridos_apos_estabilizar = 0;
-      int tecla_teste = 5; // Vamos testar com a tecla '5'
-      
-      // Captura o estado limpo pós-reset
-      barramento_inicial = digitos_value_DUV.digits;
-      
-      $display("Passo A: Iniciando bouncing mecânico (ruído) por 100 ciclos de clock...");
-      tecla_linha_alvo  = pad_linhas[tecla_teste];
-      tecla_coluna_alvo = pad_colunas[tecla_teste];
-      tecla_pressionada = 1;
-      injetar_ruido     = 1; // Ativa o gerador assíncrono do TB
-      
-      // Mantém o ruído gerando transições aleatórias por exatamente 100 clocks
-      repeat(100) @(posedge clk);
-      
-      // Checa se o DUV ignorou o ruído enquanto ele acontecia
-      barramento_pos_ruido = digitos_value_DUV.digits;
-      if (barramento_pos_ruido !== barramento_inicial) begin
-        $display("\n[ERRO DEBOUNCE] O circuito aceitou uma tecla instável durante o período de ruído!");
-        $finish;
-      end
-      $display("  [OK] Nenhuma tecla espúria foi registrada durante os 100 ciclos de oscilação.");
+      int tecla_teste = 5;
 
-      $display("Passo B: Estabilizando o sinal da tecla (fim do ruído) e aguardando validação...");
-      injetar_ruido = 0; // Sinal estabiliza no valor correto da tecla
-      
-      // Aguarda o tempo necessário para o DUV processar o debounce estável e fazer o shift (130 ciclos)
-      repeat(CICLOS_ATE_SHIFT) @(posedge clk);
-      
-      // Verifica se a tecla entrou corretamente após a estabilização
+      barramento_inicial = digitos_value_DUV.digits;
+
+      $display("Passo A: Iniciando bouncing mecânico por 120 ciclos...");
+
+      fork
+        // Thread 1: Monitora se o DUV aceitou algo durante o ruído
+        begin
+          repeat(120) @(posedge clk);
+          barramento_pos_ruido = digitos_value_DUV.digits;
+          if (barramento_pos_ruido !== barramento_inicial) begin
+            $display("\n[ERRO DEBOUNCE] Circuito aceitou tecla instável durante ruído!");
+            $finish;
+          end
+          $display("  [OK] Nenhuma tecla espúria registrada durante os 120 ciclos de oscilação.");
+        end
+
+        // Thread 2: Executa o pressionamento com ruído via task
+        begin
+          pressionar_tecla(pad_linhas[tecla_teste], pad_colunas[tecla_teste],
+                           CICLOS_ATE_SHIFT + 50, 1);
+        end
+      join
+
+      // Verificação final usando o modelo de referência
       barramento_final = digitos_value_DUV.digits;
-      
-      // Conta quantas modificações aconteceram na posição inicial do barramento
-      if (barramento_final[0] == tecla_teste) begin
-        $display("  [OK] Tecla %0d reconhecida com sucesso após o período de estabilização.", tecla_teste);
+      if (barramento_final[0] == ref_decodificar(pad_linhas[tecla_teste], pad_colunas[tecla_teste])) begin
+        $display("  [OK] Tecla %0d reconhecida corretamente após estabilização.", tecla_teste);
       end else begin
-        $display("\n[ERRO DEBOUNCE] O sistema ignorou a tecla legítima após o ruído cessar!");
-        $display("  Esperado em digits[0]: %h | Obtido: %h", tecla_teste, barramento_final[0]);
+        $display("\n[ERRO DEBOUNCE] Tecla legítima ignorada após ruído cessar!");
+        $display("  Esperado: %h | Obtido: %h",
+                 ref_decodificar(pad_linhas[tecla_teste], pad_colunas[tecla_teste]),
+                 barramento_final[0]);
         $finish;
       end
-      
-      // Garante que APENAS UMA tecla entrou (as outras posições devem continuar em reset hF)
+
+      // Verifica que apenas uma tecla entrou
       for (int i = 1; i < 20; i++) begin
         if (barramento_final[i] !== 4'hF) begin
-          $display("\n[ERRO DEBOUNCE] Multiplos registros detectados! O debounce deixou passar múltiplos repiques.");
+          $display("\n[ERRO DEBOUNCE] Múltiplos registros detectados na posição [%0d]!", i);
           $finish;
         end
       end
-      
-      // Finaliza o acionamento da tecla
-      tecla_pressionada = 0;
-      repeat(40) @(posedge clk);
 
       // ==================================================================
       // RELATÓRIO DE VERIFICAÇÃO DETALHADO — CENÁRIO 3 (DEBOUNCE)
@@ -477,12 +468,13 @@ module decodificador_de_teclado_tb;
       $display("     RELATÓRIO DE VERIFICAÇÃO — CENÁRIO 3 (DEBOUNCE)    ");
       $display("========================================================");
       $display("  Status do Cenário       : SUCESSO (PASSED)");
-      $display("  Duração do Bouncing     : 100 ciclos de clock (Injetado)");
+      $display("  Duração do Bouncing     : 120 ciclos de clock (Injetado)");
       $display("  Comportamento do Filtro : Filtragem Total (Ignorou oscilações)");
       $display("  Teclas Válidas Retidas  : 1 única tecla (Dígito %0d)", tecla_teste);
-      $display("  Barramento Resultante   : %h", digitos_value_DUV.digits);
+      $display("  Valor em digits[0]      : %h", barramento_final[0]);
       $display("========================================================");
       $display("");
+
     end
       
     // ====================================================================
@@ -541,6 +533,34 @@ module decodificador_de_teclado_tb;
         $display("\n[ERRO AUTOREPEAT] A tecla ficou retida mas o barramento só registrou %0d repetições extras.", mudancas_no_barramento);
         $finish;
       end
+      
+      $display("Passo B: Soltando a tecla e verificando cessação do autorepeat...");
+
+begin : c4_verificar_cessacao
+  logic [19:0][3:0] barramento_apos_soltar;
+  int mudancas_apos_soltar = 0;
+  int CICLOS_OBSERVACAO = 3000; // > 2 períodos de repeat (2000 ciclos) para garantir
+
+  // Captura o barramento no momento exato em que a tecla é solta
+  @(negedge clk);
+  barramento_apos_soltar = digitos_value_DUV.digits;
+
+  // Observa por 3000 ciclos se o barramento muda sem a tecla pressionada
+  repeat (CICLOS_OBSERVACAO) begin
+    @(posedge clk);
+    if (digitos_value_DUV.digits !== barramento_apos_soltar) begin
+      mudancas_apos_soltar++;
+      $display("\n[ERRO CESSACAO] O barramento mudou %0d ciclos após soltar a tecla! Valor: %h",
+               ($time / 10), digitos_value_DUV.digits);
+      $finish;
+    end
+  end
+
+  if (mudancas_apos_soltar == 0) begin
+    $display("[OK] Autorepeat cessou imediatamente após a liberação da tecla.");
+  end
+end
+      
 
       // ==================================================================
       // RELATÓRIO DE VERIFICAÇÃO DETALHADO — CENÁRIO 4 (AUTOREPEAT)
